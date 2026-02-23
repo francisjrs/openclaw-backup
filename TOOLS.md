@@ -29,7 +29,19 @@ Things like:
 
 - Preferred voice: "Nova" (warm, slightly British)
 - Default speaker: Kitchen HomePod
+
+### Notes
+
+- obsidian-vault → /home/node/obsidian-vault
 ```
+
+## Local Setup
+
+### Notes
+
+- Obsidian vault path: `/home/node/obsidian-vault`
+- Treat this as the default directory for saving/retrieving notes and useful reference docs for Franco.
+- When Franco says to "save a note" (or similar), write it in this vault unless he specifies a different location.
 
 ## Why Separate?
 
