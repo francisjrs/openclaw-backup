@@ -6,6 +6,7 @@
 - **What to call them:** Franco
 - **Pronouns:** *(optional)*
 - **Timezone:** America/Chicago
+- **Location:** Round Rock, Texas
 - **Notes:** Introduced himself and named the assistant Robotina.
 
 ## Context

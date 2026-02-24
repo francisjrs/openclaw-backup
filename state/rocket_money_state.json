@@ -1,0 +1,28 @@
+{
+  "last_scrape_date": "2026-02-24T00:49:26.585778",
+  "known_merchants": {
+    "amaya babysitter": "Childcare",
+    "venmo amaya": "Childcare",
+    "txu energy": "Bills & Utilities",
+    "atmos energy": "Utility Gas",
+    "rocket money premium": "Software & Tech",
+    "real green services": "Home & Garden",
+    "dell products lp payroll": "Income",
+    "paloma lake mud": "Bills & Utilities",
+    "water bill pflugerville": "Bills & Utilities",
+    "apple card payment": "Credit Card Payment",
+    "chase credit card": "Credit Card Payment",
+    "interest earned": "Income",
+    "surprise savings booster transfer": "Savings Transfer",
+    "internet transfer to savings": "Savings Transfer"
+  },
+  "approved_categories": {},
+  "merchant_averages": {
+    "atmos energy": 137.52,
+    "txu energy": 180.0,
+    "real green services": 67.57,
+    "rocket money premium": 6.4,
+    "paloma lake mud 2": 66.36,
+    "venmo": 330.0
+  }
+}
