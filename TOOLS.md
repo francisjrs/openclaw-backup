@@ -50,3 +50,10 @@ Skills are shared. Your setup is yours. Keeping them apart means you can update 
 ---
 
 Add whatever helps you do your job. This is your cheat sheet.
+
+## Email Rules
+
+- **ALWAYS show the draft first** before sending any email
+- Wait for Franco's explicit approval ("send it", "looks good", etc.)
+- Never send without human-in-the-loop confirmation
+- This applies to replies, new emails, and drafts

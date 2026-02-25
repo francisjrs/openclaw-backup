@@ -17,15 +17,24 @@ if not backup_repo_dir and BACKUP_REPO_FILE.exists():
     backup_repo_dir = BACKUP_REPO_FILE.read_text().strip()
 BACKUP_REPO = Path(backup_repo_dir) if backup_repo_dir else None
 
-EXCLUDE_DIRS = {'.git', 'node_modules', 'state/backup_scrubbed'}
+EXCLUDE_DIRS = {'.git', 'node_modules', 'state/backup_scrubbed', '.secrets', 'scripts/.secrets'}
 EXCLUDE_FILES = {
     '.secrets/icloud_app_password',
 }
 
 REPLACERS = [
+    # plain key=value / key: value (env/config style)
     (re.compile(r'(?i)(api[_-]?key\s*[:=]\s*)([^\s"\']+)'), r'\1[API_KEY]'),
     (re.compile(r'(?i)(token\s*[:=]\s*)([^\s"\']+)'), r'\1[TOKEN]'),
     (re.compile(r'(?i)(password\s*[:=]\s*)([^\s"\']+)'), r'\1[PASSWORD]'),
+    # JSON-style "key": "value"
+    (re.compile(r'(?i)("(?:api[_-]?key|secret|token|password|credential|auth)"\s*:\s*)"[^"]{8,}"'), r'\1"[REDACTED]"'),
+    # Google OAuth tokens by prefix
+    (re.compile(r'\bya29\.[A-Za-z0-9_\-]{20,}'), '[GOOGLE_ACCESS_TOKEN]'),
+    (re.compile(r'\b1//[A-Za-z0-9_\-]{20,}'), '[GOOGLE_REFRESH_TOKEN]'),
+    # JWT-shaped id_tokens (three base64 segments)
+    (re.compile(r'ey[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}'), '[JWT_TOKEN]'),
+    # Literals
     (re.compile(r'[ICLOUD_APP_PASSWORD]'), '[ICLOUD_APP_PASSWORD]'),
     (re.compile(r'(?i)franciscojrs@me\.com'), '[ICLOUD_EMAIL]'),
 ]
@@ -60,6 +69,9 @@ def rel_excluded(rel: str) -> bool:
     for ex in EXCLUDE_DIRS:
         if rel == ex or rel.startswith(ex + '/'):
             return True
+    # Exclude any path whose components include a .secrets directory
+    if '.secrets' in Path(rel).parts:
+        return True
     return False
 
 

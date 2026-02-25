@@ -6,8 +6,10 @@
 - **What to call them:** Franco
 - **Pronouns:** *(optional)*
 - **Timezone:** America/Chicago
-- **Location:** Round Rock, Texas
-- **Notes:** Introduced himself and named the assistant Robotina.
+- **Location:** Paloma Lake, Round Rock, Texas
+- **Origin:** From Puerto Rico
+- **First language:** Spanish
+- **Notes:** Introduced himself and named the assistant Robotina. Turning 40 on May 1st 2026. Has a 5-year-old and a 4-month-old.
 
 ## Context
 
