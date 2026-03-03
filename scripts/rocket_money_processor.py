@@ -1,291 +1,509 @@
 #!/usr/bin/env python3
 """
-Rocket Money Transaction Processor
-- Receives transaction JSON via stdin
-- Categorizes using known merchant rules + state file
-- Detects anomalies (price spikes, new merchants, duplicates)
-- Writes weekly file to Obsidian vault
-- Outputs formatted report to stdout for Discord
+rocket_money_processor.py — Rocket Money transaction processor for Robotina Finance.
+
+Receives a JSON array of transactions on stdin, applies categorization rules,
+detects anomalies, writes a weekly markdown file to the Obsidian vault, and
+prints a Discord-ready report to stdout.
+
+Usage:
+    echo '<json>' | python3 rocket_money_processor.py [--week YYYY-WNN] [--dry-run]
+
+Input JSON schema (each transaction):
+    {
+        "date":     "YYYY-MM-DD",
+        "merchant": "Merchant Name",
+        "amount":   12.34,          # positive = expense, negative = credit
+        "category": "Optional",     # existing category from Rocket Money
+        "account":  "Account Name"
+    }
+
+Exit codes:
+    0  — always (errors go to stderr)
+
+Author: Robotina Finance 🤖
 """
 
+from __future__ import annotations
+
+import argparse
 import json
-import sys
+import logging
 import os
-import re
-from datetime import datetime, timedelta
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
-STATE_FILE = "/home/node/.openclaw/workspace/state/rocket_money_state.json"
-VAULT_BASE = "/home/node/obsidian-vault/Finance/Spending"
-RECURRING_DIR = "/home/node/obsidian-vault/Finance/Recurring"
-BUDGET_FILE = "/home/node/obsidian-vault/Finance/Budget.md"
+# ── Constants ──────────────────────────────────────────────────────────────────
 
-ANOMALY_THRESHOLD = 0.30  # flag if >30% above average
+STATE_FILE    = Path("/home/node/.openclaw/workspace/state/rocket_money_state.json")
+VAULT_DIR     = Path("/home/node/obsidian-vault/Finance/Spending")
+BUDGET_FILE   = Path("/home/node/obsidian-vault/Finance/Budget.md")
+
+ANOMALY_SPIKE_PCT   = 0.30    # flag if amount is >30% above rolling average
+EMA_ALPHA           = 0.30    # weight for new value in exponential moving average
+
+# Categories that are never flagged as anomalies or sent to "needs review"
+PASS_THROUGH_CATEGORIES = frozenset({
+    "Income",
+    "Savings Transfer",
+    "Internal Transfers",
+    "Credit Card Payment",
+})
+
+# Heuristic keyword → category mapping (checked if no state match found)
+HEURISTICS: list[tuple[list[str], str]] = [
+    (["payroll", "paycheck", "direct deposit", "direct dep"], "Income"),
+    (["savings booster", "transfer to savings", "transfer from savings"], "Savings Transfer"),
+    (["credit card payment", "card payment", "autopay"], "Credit Card Payment"),
+    (["venmo", "zelle", "cashapp", "cash app", "paypal"], "Transfer"),
+    (["amazon", "amzn", "walmart", "target", "costco", "sam's club"], "Shopping"),
+    (["uber", "lyft", "parking", "shell", "chevron", "exxon", "sunoco", "valero"], "Auto & Transport"),
+    (["netflix", "spotify", "apple.com/bill", "google play", "hulu", "disney+", "youtube premium"], "Entertainment"),
+    (["restaurant", "cafe", "coffee", "chipotle", "mcdonald", "starbucks",
+       "doordash", "grubhub", "uber eats", "instacart", "pizza"], "Food & Dining"),
+    (["whataburger", "chick-fil-a", "taco bell", "subway", "wendy"], "Food & Dining"),
+    (["heb", "kroger", "whole foods", "trader joe", "aldi"], "Groceries"),
+    (["gym", "fitness", "planet fitness", "anytime fitness", "la fitness"], "Health & Fitness"),
+    (["cvs", "walgreens", "pharmacy", "rite aid", "duane reade"], "Health & Fitness"),
+    (["electric", "energy", "oncor", "txu", "atmos", "gas company"], "Bills & Utilities"),
+    (["water", "sewer", "mud ", "municipal utility"], "Bills & Utilities"),
+    (["insurance", "geico", "allstate", "state farm", "progressive"], "Insurance"),
+    (["school", "tuition", "rrisd", "linda harrington"], "Education"),
+    (["daycare", "babysitter", "childcare", "amaya"], "Childcare"),
+]
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.WARNING,
+    format="[rocket_money] %(levelname)s: %(message)s",
+)
+log = logging.getLogger(__name__)
 
 
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    return {"last_scrape_date": None, "known_merchants": {}, "approved_categories": {}, "merchant_averages": {}}
+# ── Data models ────────────────────────────────────────────────────────────────
+
+@dataclass
+class Transaction:
+    date:     str
+    merchant: str
+    amount:   float
+    category: str = ""
+    account:  str = ""
+
+    # Set during processing
+    resolved_category:    str   = field(default="", repr=False)
+    confidence:           str   = field(default="LOW", repr=False)   # HIGH / MEDIUM / LOW
+    suggested_category:   str   = field(default="", repr=False)
+    anomaly_reason:       str   = field(default="", repr=False)
+    is_duplicate:         bool  = field(default=False, repr=False)
+
+    @property
+    def merchant_key(self) -> str:
+        """Normalized lowercase merchant key for state lookups."""
+        return self.merchant.lower().strip()
+
+    @property
+    def is_pass_through(self) -> bool:
+        return self.resolved_category in PASS_THROUGH_CATEGORIES
+
+    @property
+    def is_expense(self) -> bool:
+        return self.amount > 0
+
+    @property
+    def dedup_key(self) -> str:
+        return f"{self.merchant_key}:{self.amount}:{self.date}"
 
 
-def save_state(state):
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+@dataclass
+class AppState:
+    """Persistent state loaded from / saved to STATE_FILE."""
+
+    known_merchants:    dict[str, str]   = field(default_factory=dict)
+    approved_categories: dict[str, str]  = field(default_factory=dict)
+    merchant_averages:  dict[str, float] = field(default_factory=dict)
+    ignored_merchants:  list[str]        = field(default_factory=list)
+    last_scrape_date:   Optional[str]    = None
+
+    @classmethod
+    def load(cls, path: Path) -> "AppState":
+        if not path.exists():
+            log.info("State file not found — starting fresh: %s", path)
+            return cls()
+        try:
+            with path.open(encoding="utf-8") as f:
+                data = json.load(f)
+            return cls(
+                known_merchants=data.get("known_merchants", {}),
+                approved_categories=data.get("approved_categories", {}),
+                merchant_averages=data.get("merchant_averages", {}),
+                ignored_merchants=data.get("ignored_merchants", []),
+                last_scrape_date=data.get("last_scrape_date"),
+            )
+        except (json.JSONDecodeError, OSError) as exc:
+            log.error("Failed to load state file: %s — starting fresh.", exc)
+            return cls()
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with path.open("w", encoding="utf-8") as f:
+                json.dump(self.to_dict(), f, indent=2)
+        except OSError as exc:
+            log.error("Failed to save state file: %s", exc)
+
+    def to_dict(self) -> dict:
+        return {
+            "last_scrape_date":    self.last_scrape_date,
+            "known_merchants":     self.known_merchants,
+            "approved_categories": self.approved_categories,
+            "merchant_averages":   self.merchant_averages,
+            "ignored_merchants":   self.ignored_merchants,
+        }
+
+    def update_average(self, key: str, amount: float) -> None:
+        """Update exponential moving average for a merchant."""
+        if amount <= 0:
+            return
+        current = self.merchant_averages.get(key)
+        self.merchant_averages[key] = round(
+            amount if current is None else current * (1 - EMA_ALPHA) + amount * EMA_ALPHA,
+            2,
+        )
 
 
-def normalize_merchant(name):
-    return name.lower().strip()
+# ── Categorization engine ──────────────────────────────────────────────────────
 
+def categorize(txn: Transaction, state: AppState) -> tuple[str, str]:
+    """
+    Return (category, confidence) for a transaction.
+    Priority: existing RM category → known_merchants → approved_categories
+              → heuristics → Uncategorized
+    """
+    key = txn.merchant_key
 
-def find_category(merchant_raw, state):
-    """Look up category for a merchant. Returns (category, confidence)."""
-    norm = normalize_merchant(merchant_raw)
-    # Exact match
-    if norm in state["known_merchants"]:
-        return state["known_merchants"][norm], "HIGH"
-    # Approved overrides
-    if norm in state["approved_categories"]:
-        return state["approved_categories"][norm], "HIGH"
-    # Partial match
-    for key, cat in state["known_merchants"].items():
-        if key in norm or norm in key:
+    # Existing category from Rocket Money (trust it)
+    if txn.category and txn.category not in ("", "Uncategorized"):
+        return txn.category, "HIGH"
+
+    # Exact known-merchant match
+    if key in state.known_merchants:
+        return state.known_merchants[key], "HIGH"
+
+    # Approved override
+    if key in state.approved_categories:
+        return state.approved_categories[key], "HIGH"
+
+    # Partial match in known_merchants
+    for stored_key, cat in state.known_merchants.items():
+        if stored_key in key or key in stored_key:
             return cat, "MEDIUM"
-    # Heuristic fallbacks
-    heuristics = [
-        (["payroll", "paycheck", "direct deposit", "income"], "Income"),
-        (["savings transfer", "savings booster", "transfer to savings", "transfer from savings"], "Savings Transfer"),
-        (["credit card payment", "card payment"], "Credit Card Payment"),
-        (["venmo", "zelle", "cashapp", "paypal"], "Transfer"),
-        (["amazon", "amzn", "walmart", "target", "costco"], "Shopping"),
-        (["uber", "lyft", "parking", "gas station", "shell", "chevron", "exxon", "sunoco"], "Auto & Transport"),
-        (["netflix", "spotify", "apple", "google play", "hulu", "disney"], "Entertainment"),
-        (["restaurant", "cafe", "coffee", "chipotle", "mcdonald", "starbucks", "doordash", "grubhub", "uber eats"], "Food & Dining"),
-        (["gym", "fitness", "planet fitness", "anytime fitness"], "Health & Fitness"),
-        (["cvs", "walgreens", "pharmacy", "rite aid"], "Health & Fitness"),
-        (["electric", "energy", "utility", "water", "sewer", "gas company", "atmos", "txu", "oncor"], "Bills & Utilities"),
-        (["insurance", "geico", "allstate", "state farm"], "Insurance"),
-        (["mud", "municipal utility"], "Bills & Utilities"),
-    ]
-    norm_lower = norm.lower()
-    for keywords, cat in heuristics:
-        if any(k in norm_lower for k in keywords):
+
+    # Keyword heuristics
+    for keywords, cat in HEURISTICS:
+        if any(kw in key for kw in keywords):
             return cat, "MEDIUM"
+
     return "Uncategorized", "LOW"
 
 
-def detect_anomaly(merchant_raw, amount, state):
-    """Returns anomaly description or None."""
-    norm = normalize_merchant(merchant_raw)
-    avg = state["merchant_averages"].get(norm)
-    if avg and amount > 0:
-        pct = (amount - avg) / avg
-        if pct > ANOMALY_THRESHOLD:
-            return f"+{pct*100:.0f}% above average (avg ${avg:.2f})"
-    return None
+# ── Processing pipeline ────────────────────────────────────────────────────────
 
+def process_transactions(
+    transactions: list[Transaction],
+    state: AppState,
+) -> tuple[list[Transaction], list[Transaction], list[Transaction]]:
+    """
+    Categorize, deduplicate, and detect anomalies.
 
-def update_merchant_average(merchant_raw, amount, state):
-    """Update rolling average for a merchant."""
-    norm = normalize_merchant(merchant_raw)
-    if amount > 0:
-        current = state["merchant_averages"].get(norm)
-        if current is None:
-            state["merchant_averages"][norm] = amount
+    Returns:
+        (auto_approved, needs_review, anomalies)
+    """
+    auto_approved: list[Transaction] = []
+    needs_review:  list[Transaction] = []
+    anomalies:     list[Transaction] = []
+    seen_keys: set[str] = set()
+
+    for txn in transactions:
+        # Duplicate detection
+        if txn.dedup_key in seen_keys:
+            txn.is_duplicate = True
+            txn.anomaly_reason = "Possible duplicate transaction"
+            anomalies.append(txn)
+            continue
+        seen_keys.add(txn.dedup_key)
+
+        # Skip ignored merchants
+        if txn.merchant_key in state.ignored_merchants:
+            log.info("Skipping ignored merchant: %s", txn.merchant)
+            continue
+
+        # Categorize
+        txn.resolved_category, txn.confidence = categorize(txn, state)
+
+        # Pass-through categories skip anomaly checks and go straight to approved
+        if txn.resolved_category in PASS_THROUGH_CATEGORIES:
+            auto_approved.append(txn)
+            continue
+
+        # Anomaly detection (expenses only)
+        if txn.is_expense:
+            avg = state.merchant_averages.get(txn.merchant_key)
+            if avg and avg > 0:
+                pct = (txn.amount - avg) / avg
+                if pct > ANOMALY_SPIKE_PCT:
+                    txn.anomaly_reason = f"+{pct * 100:.0f}% above avg (avg ${avg:.2f})"
+                    anomalies.append(txn)
+            # Update rolling average
+            state.update_average(txn.merchant_key, txn.amount)
+
+        # Route by confidence
+        if txn.confidence == "HIGH":
+            auto_approved.append(txn)
         else:
-            # Simple exponential moving average
-            state["merchant_averages"][norm] = round(current * 0.7 + amount * 0.3, 2)
+            txn.suggested_category = txn.resolved_category
+            needs_review.append(txn)
+
+    return auto_approved, needs_review, anomalies
 
 
-def get_week_label(date_str=None):
-    """Returns YYYY-WNN label for a given date string or today."""
-    if date_str:
-        try:
-            d = datetime.strptime(date_str, "%Y-%m-%d")
-        except Exception:
-            d = datetime.now()
-    else:
-        d = datetime.now()
-    week_num = d.isocalendar()[1]
-    return f"{d.year}-W{week_num:02d}"
+# ── Vault writer ───────────────────────────────────────────────────────────────
 
-
-def write_vault_file(week_label, transactions, categorized, needs_review, anomalies):
-    """Write the weekly transaction markdown file to Obsidian vault."""
-    os.makedirs(VAULT_BASE, exist_ok=True)
-    filepath = os.path.join(VAULT_BASE, f"{week_label}-transactions.md")
+def write_vault_file(
+    week_label: str,
+    all_txns: list[Transaction],
+    auto_approved: list[Transaction],
+    needs_review: list[Transaction],
+    anomalies: list[Transaction],
+) -> Path:
+    """Write the weekly transaction markdown to the Obsidian vault."""
+    VAULT_DIR.mkdir(parents=True, exist_ok=True)
+    filepath = VAULT_DIR / f"{week_label}-transactions.md"
 
     total_spending = sum(
-        t["amount"] for t in transactions
-        if t.get("amount", 0) > 0 and t.get("category") not in ("Income", "Savings Transfer", "Internal Transfers")
+        t.amount for t in all_txns
+        if t.is_expense and t.resolved_category not in PASS_THROUGH_CATEGORIES
     )
 
-    lines = [
-        f"---",
+    now = datetime.now().isoformat(timespec="seconds")
+
+    lines: list[str] = [
+        "---",
         f"week: {week_label}",
-        f"source: rocket-money",
-        f"status: pending-review",
+        "source: rocket-money",
+        "status: pending-review",
         f"total_spending: {total_spending:.2f}",
-        f"scraped_at: {datetime.now().isoformat()}",
-        f"---",
-        f"",
+        f"scraped_at: {now}",
+        "---",
+        "",
         f"# Transactions: {week_label}",
-        f"",
-        f"## Summary",
-        f"- Total spending: ${total_spending:.2f}",
-        f"- Auto-categorized: {len(categorized)}",
+        "",
+        "## Summary",
+        f"- Total transactions: {len(all_txns)}",
+        f"- Total spending: ${total_spending:,.2f}",
+        f"- Auto-categorized: {len(auto_approved)}",
         f"- Needs review: {len(needs_review)}",
         f"- Anomalies: {len(anomalies)}",
-        f"",
+        "",
     ]
 
-    if categorized:
+    if auto_approved:
         lines += [
-            f"## Categorized (auto)",
-            f"| Date | Merchant | Amount | Category | Account |",
-            f"|------|----------|--------|----------|---------|",
+            "## Categorized",
+            "| Date | Merchant | Amount | Category | Account |",
+            "|------|----------|--------|----------|---------|",
         ]
-        for t in categorized:
-            lines.append(f"| {t.get('date','')} | {t.get('merchant','')} | ${t.get('amount',0):.2f} | {t.get('category','')} | {t.get('account','')} |")
+        for t in auto_approved:
+            lines.append(
+                f"| {t.date} | {t.merchant} | ${t.amount:,.2f} | {t.resolved_category} | {t.account} |"
+            )
         lines.append("")
 
     if needs_review:
         lines += [
-            f"## Needs Review",
-            f"| Date | Merchant | Amount | Suggested | Confidence |",
-            f"|------|----------|--------|-----------|------------|",
+            "## Needs Review",
+            "| Date | Merchant | Amount | Suggested | Confidence |",
+            "|------|----------|--------|-----------|------------|",
         ]
         for t in needs_review:
-            lines.append(f"| {t.get('date','')} | {t.get('merchant','')} | ${t.get('amount',0):.2f} | {t.get('suggested_category','')} | {t.get('confidence','')} |")
+            lines.append(
+                f"| {t.date} | {t.merchant} | ${t.amount:,.2f} | {t.suggested_category} | {t.confidence} |"
+            )
         lines.append("")
 
     if anomalies:
-        lines += [f"## Anomalies", ""]
-        for a in anomalies:
-            lines.append(f"- **{a['merchant']}** ${a['amount']:.2f}: {a['reason']}")
+        lines += ["## Anomalies", ""]
+        for t in anomalies:
+            lines.append(f"- **{t.merchant}** ${t.amount:,.2f}: {t.anomaly_reason}")
         lines.append("")
 
-    with open(filepath, "w") as f:
-        f.write("\n".join(lines))
-
+    filepath.write_text("\n".join(lines), encoding="utf-8")
+    log.info("Wrote vault file: %s", filepath)
     return filepath
 
 
-def format_discord_report(week_label, categorized, needs_review, anomalies, vault_path):
-    """Format the report for Discord."""
-    lines = [
+# ── Discord report formatter ───────────────────────────────────────────────────
+
+def format_report(
+    week_label: str,
+    auto_approved: list[Transaction],
+    needs_review: list[Transaction],
+    anomalies: list[Transaction],
+    vault_path: Path,
+) -> str:
+    """Build a Discord-ready markdown report."""
+    lines: list[str] = [
         f"## 💰 Weekly Transaction Review — {week_label}",
-        f"",
+        "",
     ]
 
-    if categorized:
-        lines.append(f"**✅ Auto-categorized ({len(categorized)} transactions)**")
-        for t in categorized:
-            sign = "+" if t.get("amount", 0) < 0 else "-"
-            lines.append(f"- {t.get('date','')} | {t.get('merchant','')} | ${abs(t.get('amount',0)):.2f} → {t.get('category','')}")
+    total_spending = sum(
+        t.amount for t in auto_approved + needs_review
+        if t.is_expense and t.resolved_category not in PASS_THROUGH_CATEGORIES
+    )
+    lines += [f"> **Total spending this week: ${total_spending:,.2f}**", ""]
+
+    if auto_approved:
+        lines.append(f"**✅ Auto-categorized ({len(auto_approved)})**")
+        for t in auto_approved:
+            lines.append(
+                f"- `{t.date}` {t.merchant} — ${t.amount:,.2f} → {t.resolved_category}"
+            )
         lines.append("")
 
     if needs_review:
-        lines.append(f"**⚠️ Needs Your Input ({len(needs_review)} transactions)**")
+        lines.append(f"**⚠️ Needs your input ({len(needs_review)})**")
         for t in needs_review:
-            lines.append(f"- {t.get('date','')} | {t.get('merchant','')} | ${t.get('amount',0):.2f} → suggested: {t.get('suggested_category','')} ({t.get('confidence','')})")
+            lines.append(
+                f"- `{t.date}` **{t.merchant}** — ${t.amount:,.2f} → suggested: *{t.suggested_category}* ({t.confidence})"
+            )
         lines.append("")
 
     if anomalies:
         lines.append(f"**🚨 Anomalies ({len(anomalies)})**")
-        for a in anomalies:
-            lines.append(f"- {a['merchant']} ${a['amount']:.2f}: {a['reason']}")
+        for t in anomalies:
+            lines.append(f"- **{t.merchant}** ${t.amount:,.2f}: {t.anomaly_reason}")
         lines.append("")
 
     lines += [
-        f"Saved to vault: `{os.path.basename(vault_path)}`",
-        f"",
-        f"Reply with: `approve all`, `MERCHANT -> Category`, or `ignore MERCHANT`",
+        f"> Saved: `{vault_path.name}`",
+        "",
+        "Reply with: `approve all` · `MERCHANT -> Category` · `ignore MERCHANT`",
     ]
 
     return "\n".join(lines)
 
 
-def main():
+# ── CLI ────────────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Process Rocket Money transactions and generate a weekly review."
+    )
+    parser.add_argument(
+        "--week", type=str, default=None,
+        help="Force week label as YYYY-WNN (default: inferred from transaction dates)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Process transactions but do not write vault file or update state",
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Enable verbose logging to stderr",
+    )
+    return parser.parse_args()
+
+
+def infer_week_label(transactions: list[Transaction]) -> str:
+    """Infer ISO week label from the first transaction's date, or use today."""
+    for txn in transactions:
+        try:
+            d = datetime.strptime(txn.date, "%Y-%m-%d")
+            return f"{d.year}-W{d.isocalendar()[1]:02d}"
+        except ValueError:
+            continue
+    d = datetime.now()
+    return f"{d.year}-W{d.isocalendar()[1]:02d}"
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    args = parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    # Read stdin
     raw = sys.stdin.read().strip()
     if not raw:
-        print("ERROR: No transaction data received on stdin.")
-        sys.exit(1)
+        print("ERROR: No transaction data on stdin.", file=sys.stderr)
+        print("⚠️ No transaction data received. Please pipe a JSON array of transactions.")
+        sys.exit(0)
 
     try:
-        transactions = json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"ERROR: Failed to parse transaction JSON: {e}")
-        sys.exit(1)
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.error("JSON parse error: %s", exc)
+        print(f"⚠️ Failed to parse transaction JSON: {exc}")
+        sys.exit(0)
 
-    state = load_state()
+    if not isinstance(data, list):
+        print("⚠️ Expected a JSON array of transactions.")
+        sys.exit(0)
 
-    categorized = []
-    needs_review = []
-    anomalies = []
+    # Build transaction objects
+    transactions: list[Transaction] = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            log.warning("Skipping non-dict item at index %d", i)
+            continue
+        try:
+            transactions.append(Transaction(
+                date=str(item.get("date", "")),
+                merchant=str(item.get("merchant", item.get("description", "Unknown"))),
+                amount=float(item.get("amount", 0)),
+                category=str(item.get("category", "")),
+                account=str(item.get("account", "")),
+            ))
+        except (TypeError, ValueError) as exc:
+            log.warning("Skipping malformed transaction at index %d: %s", i, exc)
 
-    # Track duplicates
-    seen = {}
+    if not transactions:
+        print("⚠️ No valid transactions found in input.")
+        sys.exit(0)
 
-    for t in transactions:
-        merchant = t.get("merchant", t.get("description", "Unknown"))
-        amount = float(t.get("amount", 0))
-        date = t.get("date", "")
-        account = t.get("account", "")
-        existing_category = t.get("category", "")
+    log.info("Processing %d transaction(s).", len(transactions))
 
-        # Skip income and transfers from anomaly/review (they're expected)
-        skip_review = existing_category in ("Income", "Savings Transfer", "Internal Transfers", "Credit Card Payment")
+    # Load state
+    state = AppState.load(STATE_FILE)
 
-        # Categorize
-        if existing_category and existing_category != "Uncategorized":
-            category = existing_category
-            confidence = "HIGH"
-        else:
-            category, confidence = find_category(merchant, state)
+    # Process
+    auto_approved, needs_review, anomalies = process_transactions(transactions, state)
 
-        t["category"] = category
-        t["confidence"] = confidence
-        t["merchant"] = merchant
+    # Determine week label
+    week_label = args.week or infer_week_label(transactions)
 
-        # Duplicate detection
-        dedup_key = f"{merchant}:{amount}:{date}"
-        if dedup_key in seen:
-            anomalies.append({"merchant": merchant, "amount": amount, "reason": "Possible duplicate transaction"})
-        else:
-            seen[dedup_key] = True
-
-        # Anomaly detection
-        if not skip_review and amount > 0:
-            anomaly_reason = detect_anomaly(merchant, amount, state)
-            if anomaly_reason:
-                anomalies.append({"merchant": merchant, "amount": amount, "reason": anomaly_reason})
-
-        # Update merchant average
-        if amount > 0 and not skip_review:
-            update_merchant_average(merchant, amount, state)
-
-        # Route to categorized or needs_review
-        if confidence == "HIGH" or skip_review:
-            categorized.append(t)
-        else:
-            t["suggested_category"] = category
-            needs_review.append(t)
-
-    # Get week label from first transaction date
-    first_date = transactions[0].get("date") if transactions else None
-    week_label = get_week_label(first_date)
+    if args.dry_run:
+        print(f"[dry-run] Week: {week_label}")
+        print(f"[dry-run] Auto: {len(auto_approved)}, Review: {len(needs_review)}, Anomalies: {len(anomalies)}")
+        sys.exit(0)
 
     # Write vault file
-    vault_path = write_vault_file(week_label, transactions, categorized, needs_review, anomalies)
+    vault_path = write_vault_file(week_label, transactions, auto_approved, needs_review, anomalies)
 
     # Update state
-    state["last_scrape_date"] = datetime.now().isoformat()
-    save_state(state)
+    state.last_scrape_date = datetime.now().isoformat(timespec="seconds")
+    state.save(STATE_FILE)
 
-    # Output Discord report
-    print(format_discord_report(week_label, categorized, needs_review, anomalies, vault_path))
+    # Print Discord report
+    print(format_report(week_label, auto_approved, needs_review, anomalies, vault_path))
 
 
 if __name__ == "__main__":
